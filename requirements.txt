@@ -1,0 +1,2 @@
+# Install DocMind itself; pyproject.toml contains the complete runtime dependency list.
+-e .
