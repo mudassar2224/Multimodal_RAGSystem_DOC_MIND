@@ -1,4 +1,5 @@
 import asyncio
+import os
 import uuid
 
 import streamlit as st
@@ -16,6 +17,33 @@ from docmind.models.hf import (
 from docmind.retrieval.hybrid import HybridRetriever
 from docmind.storage.database import Database
 from docmind.storage.object_store import get_object_store
+
+
+def load_streamlit_secrets() -> None:
+    """Expose Community Cloud secrets to the shared Pydantic settings loader."""
+    for name in (
+        "HF_TOKEN",
+        "HF_PROVIDER",
+        "QWEN_MODEL",
+        "TEXT_EMBEDDING_MODEL",
+        "VISUAL_RETRIEVAL_MODEL",
+        "VISUAL_ENDPOINT_URL",
+        "ASR_MODEL",
+        "DATABASE_URL",
+        "OBJECT_STORAGE_BACKEND",
+        "LOCAL_OBJECT_DIR",
+        "S3_BUCKET",
+        "S3_ENDPOINT_URL",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "MAX_UPLOAD_MB",
+        "VIDEO_FRAME_INTERVAL_SECONDS",
+    ):
+        if name in st.secrets:
+            os.environ.setdefault(name, str(st.secrets[name]))
+
+
+load_streamlit_secrets()
 
 
 @st.cache_resource
