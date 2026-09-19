@@ -223,7 +223,7 @@ def _render_single_preview(name: str, mime: str | None, data: bytes | None, url:
         return
 
     if mime.startswith("image/"):
-        st.image(data if data is not None else url, use_container_width=True)
+        st.image(data if data is not None else url, width="stretch")
     elif mime.startswith("video/"):
         st.video(data if data is not None else url)
     elif mime.startswith("audio/"):
@@ -345,7 +345,7 @@ with st.sidebar:
         label = _doc_label(doc)
         st.markdown(f"{_file_icon(label)} {label}")
 
-    if st.button("New conversation", use_container_width=True):
+    if st.button("New conversation", width="stretch"):
         st.session_state.thread_id = str(uuid.uuid4())
         st.session_state.uploader_key += 1
         st.session_state.last_sources = []
@@ -373,10 +373,10 @@ with st.expander("＋ Add files to this chat", expanded=False):
 
     col_process, col_cancel = st.columns(2)
     process_clicked = col_process.button(
-        "Process Files", type="primary", use_container_width=True, disabled=not uploads
+        "Process Files", type="primary", width="stretch", disabled=not uploads
     )
     cancel_clicked = col_cancel.button(
-        "Cancel", use_container_width=True, disabled=not uploads
+        "Cancel", width="stretch", disabled=not uploads
     )
 
     if cancel_clicked:
