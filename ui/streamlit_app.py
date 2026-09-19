@@ -7,7 +7,11 @@ import io
 import json
 import mimetypes
 import os
+import shutil
+import subprocess
+import tempfile
 import uuid
+from pathlib import Path
 
 import streamlit as st
 
@@ -168,6 +172,78 @@ def _cache_file(thread_id: str, name: str, data: bytes, mime: str | None) -> Non
     if "file_cache" not in st.session_state:
         st.session_state.file_cache = {}
     st.session_state.file_cache.setdefault(thread_id, {})[name] = {"data": data, "mime": mime}
+
+
+def _replace_cache_entry(thread_id: str, old_name: str, new_name: str, data: bytes, mime: str) -> None:
+    """Swap a superseded legacy-format cache entry for its converted
+    replacement, so the preview tabs show only the file that actually got
+    indexed."""
+    cache = st.session_state.file_cache.setdefault(thread_id, {})
+    cache.pop(old_name, None)
+    cache[new_name] = {"data": data, "mime": mime}
+    processed = st.session_state.processed_files.setdefault(thread_id, set())
+    processed.discard(old_name)
+    processed.add(new_name)
+
+
+# ---------------------------------------------------------------------------
+# Legacy Office format conversion (.ppt/.doc/.xls -> .pptx/.docx/.xlsx).
+#
+# The docmind ingestion service only accepts modern OOXML formats, so these
+# old binary formats get converted here *before* being handed to it, using
+# headless LibreOffice. LibreOffice isn't a Python package — it has to be a
+# system binary. On Streamlit Community Cloud, add a `packages.txt` file to
+# your repo containing a line with `libreoffice` (or the smaller
+# `libreoffice-impress` / `libreoffice-writer` / `libreoffice-calc` for just
+# one format) and it gets installed via apt automatically on deploy.
+# ---------------------------------------------------------------------------
+_LEGACY_TO_MODERN = {"ppt": "pptx", "doc": "docx", "xls": "xlsx"}
+_OOXML_MIME = {
+    "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+}
+
+
+def _soffice_available() -> bool:
+    return shutil.which("soffice") is not None or shutil.which("libreoffice") is not None
+
+
+def _convert_legacy_office(data: bytes, filename: str):
+    """Convert a legacy .ppt/.doc/.xls file to its modern OOXML equivalent.
+    Returns (converted_bytes, new_filename, new_mime), or None if
+    LibreOffice isn't installed or the conversion failed."""
+    ext = filename.rsplit(".", 1)[-1].lower()
+    target_ext = _LEGACY_TO_MODERN.get(ext)
+    if not target_ext:
+        return None
+
+    binary = shutil.which("soffice") or shutil.which("libreoffice")
+    if not binary:
+        return None
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        src_path = Path(tmpdir) / filename
+        src_path.write_bytes(data)
+        try:
+            subprocess.run(
+                [
+                    binary, "--headless", "--norestore",
+                    "--convert-to", target_ext, "--outdir", tmpdir, str(src_path),
+                ],
+                check=True,
+                capture_output=True,
+                timeout=120,
+            )
+        except Exception:  # noqa: BLE001 -- any conversion failure just falls back to "unsupported"
+            return None
+
+        out_path = src_path.with_suffix(f".{target_ext}")
+        if not out_path.exists():
+            return None
+
+        new_name = f"{src_path.stem}.{target_ext}"
+        return out_path.read_bytes(), new_name, _OOXML_MIME[target_ext]
 
 
 def _doc_bytes_and_mime(doc, thread_id: str):
@@ -371,13 +447,20 @@ with st.expander("＋ Add files to this chat", expanded=False):
         for upload in uploads:
             _cache_file(st.session_state.thread_id, upload.name, upload.getvalue(), upload.type)
 
-        legacy = [u.name for u in uploads if u.name.lower().endswith((".ppt", ".doc", ".xls"))]
+        legacy = [u.name for u in uploads if u.name.lower().rsplit(".", 1)[-1] in _LEGACY_TO_MODERN]
         if legacy:
-            st.warning(
-                "Your indexer doesn't support legacy Office formats (confirmed for `.ppt`, likely also "
-                "`.doc`/`.xls`): " + ", ".join(legacy) + ". Save these as `.pptx`/`.docx`/`.xlsx` "
-                "before processing, or Process Files will fail for them."
-            )
+            if _soffice_available():
+                st.info(
+                    "Legacy Office file(s) will be auto-converted to a modern format "
+                    "(.pptx/.docx/.xlsx) before indexing: " + ", ".join(legacy)
+                )
+            else:
+                st.warning(
+                    "Legacy Office format(s) detected, and LibreOffice (needed to auto-convert them) isn't "
+                    "installed on this deployment: " + ", ".join(legacy) + ". Add a `packages.txt` file to "
+                    "your repo containing `libreoffice` to enable automatic conversion, or save these as "
+                    "`.pptx`/`.docx`/`.xlsx` yourself before uploading."
+                )
 
     col_process, col_cancel = st.columns(2)
     process_clicked = col_process.button(
@@ -397,26 +480,57 @@ with st.expander("＋ Add files to this chat", expanded=False):
         progress = st.progress(0)
         successful_uploads = 0
         for index, upload in enumerate(uploads, start=1):
+            index_name = upload.name
+            index_bytes = upload.getvalue()
+            index_mime = upload.type
+            ext = index_name.rsplit(".", 1)[-1].lower()
+            conversion_failed = False
+
+            if ext in _LEGACY_TO_MODERN:
+                with st.spinner(f"Converting {index_name} to .{_LEGACY_TO_MODERN[ext]}…"):
+                    converted = _convert_legacy_office(index_bytes, index_name)
+                if converted:
+                    index_bytes, index_name, index_mime = converted
+                elif not _soffice_available():
+                    st.error(
+                        f"{upload.name}: can't auto-convert — LibreOffice isn't installed on this deployment. "
+                        "Add a `packages.txt` file to your repo containing `libreoffice` and redeploy, or "
+                        f"save this as `.{_LEGACY_TO_MODERN[ext]}` manually and re-upload."
+                    )
+                    conversion_failed = True
+                else:
+                    st.error(
+                        f"{upload.name}: automatic conversion to .{_LEGACY_TO_MODERN[ext]} failed. "
+                        f"Save it as `.{_LEGACY_TO_MODERN[ext]}` manually and re-upload."
+                    )
+                    conversion_failed = True
+
+            if conversion_failed:
+                progress.progress(index / len(uploads))
+                continue
+
             try:
-                with st.spinner(f"Indexing {upload.name}…"):
+                with st.spinner(f"Indexing {index_name}…"):
                     asyncio.run(
                         ingestion.index_upload(
                             st.session_state.thread_id,
-                            upload.name,
-                            upload.getvalue(),
-                            upload.type,
+                            index_name,
+                            index_bytes,
+                            index_mime,
                         )
                     )
                 successful_uploads += 1
-                st.session_state.processed_files.setdefault(st.session_state.thread_id, set()).add(upload.name)
+                if index_name != upload.name:
+                    _replace_cache_entry(st.session_state.thread_id, upload.name, index_name, index_bytes, index_mime)
+                else:
+                    st.session_state.processed_files.setdefault(st.session_state.thread_id, set()).add(upload.name)
             except Exception as error:  # noqa: BLE001 -- each upload must fail independently
                 message = str(error)
-                if "unsupported file type" in message.lower() and upload.name.lower().endswith((".ppt", ".doc", ".xls")):
-                    ext = upload.name.rsplit(".", 1)[-1].lower()
-                    modern = {"ppt": "pptx", "doc": "docx", "xls": "xlsx"}[ext]
+                if "unsupported file type" in message.lower() and ext in _LEGACY_TO_MODERN:
                     st.error(
-                        f"{upload.name}: your indexer doesn't support the legacy `.{ext}` format. "
-                        f"Save it as `.{modern}` (File → Save As in PowerPoint/Word/Excel) and upload that instead."
+                        f"{upload.name}: still rejected as `.{ext}` even after conversion — "
+                        f"the indexer may expect a specific `.{_LEGACY_TO_MODERN[ext]}` structure. "
+                        f"Try re-saving it manually as `.{_LEGACY_TO_MODERN[ext]}`."
                     )
                 else:
                     st.error(f"{upload.name}: {error}")
