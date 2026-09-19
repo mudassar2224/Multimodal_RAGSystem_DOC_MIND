@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import contextlib
 import csv
 import html
 import io
@@ -184,6 +185,35 @@ def _doc_bytes_and_mime(doc, thread_id: str):
     return label, None, None, url
 
 
+# ---------------------------------------------------------------------------
+# Optional inline preview for Word / PowerPoint files. Neither python-docx
+# nor python-pptx is a hard dependency of this app, so these degrade to a
+# plain "download instead" message if the library isn't installed — add
+# `python-docx` and/or `python-pptx` to requirements.txt to turn them on.
+# ---------------------------------------------------------------------------
+def _extract_docx_text(data: bytes) -> str | None:
+    with contextlib.suppress(Exception):
+        import docx  # python-docx
+
+        document = docx.Document(io.BytesIO(data))
+        return "\n\n".join(p.text for p in document.paragraphs if p.text.strip())
+    return None
+
+
+def _extract_pptx_text(data: bytes) -> str | None:
+    with contextlib.suppress(Exception):
+        from pptx import Presentation  # python-pptx
+
+        presentation = Presentation(io.BytesIO(data))
+        slides = []
+        for i, slide in enumerate(presentation.slides, start=1):
+            lines = [shape.text for shape in slide.shapes if getattr(shape, "has_text_frame", False) and shape.text.strip()]
+            if lines:
+                slides.append(f"**Slide {i}**\n" + "\n".join(lines))
+        return "\n\n---\n\n".join(slides) if slides else None
+    return None
+
+
 def _render_single_preview(name: str, mime: str | None, data: bytes | None, url: str | None = None) -> None:
     mime = mime or mimetypes.guess_type(name)[0] or ""
     lower_name = name.lower()
@@ -224,6 +254,28 @@ def _render_single_preview(name: str, mime: str | None, data: bytes | None, url:
             st.caption("Preview limited to the first 25 rows.")
         except Exception:  # noqa: BLE001 -- fall back to plain text if it isn't valid CSV
             st.text(data.decode("utf-8", errors="replace")[:5000])
+    elif data is not None and lower_name.endswith(".docx"):
+        text = _extract_docx_text(data)
+        if text:
+            st.text(text[:5000])
+            if len(text) > 5000:
+                st.caption("Preview truncated — showing the first 5,000 characters.")
+        else:
+            st.info(
+                "Inline Word preview needs the `python-docx` package. "
+                "Add it to requirements.txt to enable this — for now, download the file to view it."
+            )
+    elif data is not None and lower_name.endswith(".pptx"):
+        text = _extract_pptx_text(data)
+        if text:
+            st.markdown(text[:5000])
+            if len(text) > 5000:
+                st.caption("Preview truncated — showing the first 5,000 characters.")
+        else:
+            st.info(
+                "Inline PowerPoint preview needs the `python-pptx` package. "
+                "Add it to requirements.txt to enable this — for now, download the file to view it."
+            )
     elif url:
         st.info(f"No inline preview for this file type ({mime or 'unknown type'}).")
         st.markdown(f"[Open file]({url})")
@@ -271,6 +323,8 @@ if "last_sources" not in st.session_state:
     st.session_state.last_sources = []
 if "file_cache" not in st.session_state:
     st.session_state.file_cache = {}
+if "processed_files" not in st.session_state:
+    st.session_state.processed_files = {}
 
 try:
     database, ingestion, graph = services()
@@ -302,13 +356,20 @@ with st.expander("＋ Add files to this chat", expanded=False):
         "Upload documents, images, audio, or video",
         accept_multiple_files=True,
         type=[
-            "pdf", "docx", "pptx", "xlsx", "txt", "md", "csv", "json",
+            "pdf", "doc", "docx", "ppt", "pptx", "xls", "xlsx", "txt", "md", "csv", "json",
             "jpg", "jpeg", "png", "webp",
             "mp3", "wav", "m4a",
             "mp4", "mov", "mkv", "webm",
         ],
         key=f"uploads-{st.session_state.thread_id}-{st.session_state.uploader_key}",
     )
+
+    # Cache bytes the instant files are selected — this is what the preview
+    # section below reads from, entirely independent of whatever name the
+    # backend ends up storing the file under.
+    if uploads:
+        for upload in uploads:
+            _cache_file(st.session_state.thread_id, upload.name, upload.getvalue(), upload.type)
 
     col_process, col_cancel = st.columns(2)
     process_clicked = col_process.button(
@@ -339,6 +400,7 @@ with st.expander("＋ Add files to this chat", expanded=False):
                         )
                     )
                 successful_uploads += 1
+                st.session_state.processed_files.setdefault(st.session_state.thread_id, set()).add(upload.name)
             except Exception as error:  # noqa: BLE001 -- each upload must fail independently
                 st.error(f"{upload.name}: {error}")
             progress.progress(index / len(uploads))
@@ -351,27 +413,40 @@ with st.expander("＋ Add files to this chat", expanded=False):
             st.warning("Failed files were not indexed. Fix the displayed issue, then upload them again.")
 
 # ---------------------------------------------------------------------------
-# Playable / viewable preview of every file in this chat — already-processed
-# documents plus anything just selected but not yet processed. One tab per
-# file so video/audio/PDF/etc. get real width to render in, instead of being
-# squeezed into the sidebar.
+# Playable / viewable preview of every file in this chat. Built cache-first:
+# every file selected or processed in this browser session has its real
+# bytes in st.session_state.file_cache, keyed by the name you uploaded it
+# under — so preview never depends on matching that name against whatever
+# the backend renamed/prefixed it to in the database. Documents that exist
+# in the database but weren't touched this session (e.g. from an earlier
+# visit) have no local bytes, so those fall back to a database-exposed URL
+# if there is one, or a download-only note if not.
 # ---------------------------------------------------------------------------
-existing_names = {_doc_label(doc) for doc in conversation_documents}
+thread_cache = st.session_state.file_cache.get(st.session_state.thread_id, {})
+processed_names = st.session_state.processed_files.get(st.session_state.thread_id, set())
+
 preview_entries = []
+seen_lower = set()
+
+for name, cached in thread_cache.items():
+    preview_entries.append({
+        "label": name,
+        "mime": cached["mime"],
+        "data": cached["data"],
+        "url": None,
+        "pending": name not in processed_names,
+    })
+    seen_lower.add(name.lower())
 
 for doc in conversation_documents:
-    label, mime, data, url = _doc_bytes_and_mime(doc, st.session_state.thread_id)
+    label = _doc_label(doc)
+    # Skip anything already covered by a cache entry above (fuzzy match,
+    # since the stored label may be a renamed/prefixed version of the
+    # original filename).
+    if any(cn in label.lower() or label.lower() in cn for cn in seen_lower):
+        continue
+    _, mime, data, url = _doc_bytes_and_mime(doc, st.session_state.thread_id)
     preview_entries.append({"label": label, "mime": mime, "data": data, "url": url, "pending": False})
-
-if uploads:
-    for upload in uploads:
-        if upload.name in existing_names:
-            continue
-        data = upload.getvalue()
-        _cache_file(st.session_state.thread_id, upload.name, data, upload.type)
-        preview_entries.append(
-            {"label": upload.name, "mime": upload.type, "data": data, "url": None, "pending": True}
-        )
 
 if preview_entries:
     st.subheader("📎 Files in this chat")
