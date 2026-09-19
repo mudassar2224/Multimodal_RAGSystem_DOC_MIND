@@ -371,6 +371,14 @@ with st.expander("＋ Add files to this chat", expanded=False):
         for upload in uploads:
             _cache_file(st.session_state.thread_id, upload.name, upload.getvalue(), upload.type)
 
+        legacy = [u.name for u in uploads if u.name.lower().endswith((".ppt", ".doc", ".xls"))]
+        if legacy:
+            st.warning(
+                "Your indexer doesn't support legacy Office formats (confirmed for `.ppt`, likely also "
+                "`.doc`/`.xls`): " + ", ".join(legacy) + ". Save these as `.pptx`/`.docx`/`.xlsx` "
+                "before processing, or Process Files will fail for them."
+            )
+
     col_process, col_cancel = st.columns(2)
     process_clicked = col_process.button(
         "Process Files", type="primary", width="stretch", disabled=not uploads
@@ -402,7 +410,16 @@ with st.expander("＋ Add files to this chat", expanded=False):
                 successful_uploads += 1
                 st.session_state.processed_files.setdefault(st.session_state.thread_id, set()).add(upload.name)
             except Exception as error:  # noqa: BLE001 -- each upload must fail independently
-                st.error(f"{upload.name}: {error}")
+                message = str(error)
+                if "unsupported file type" in message.lower() and upload.name.lower().endswith((".ppt", ".doc", ".xls")):
+                    ext = upload.name.rsplit(".", 1)[-1].lower()
+                    modern = {"ppt": "pptx", "doc": "docx", "xls": "xlsx"}[ext]
+                    st.error(
+                        f"{upload.name}: your indexer doesn't support the legacy `.{ext}` format. "
+                        f"Save it as `.{modern}` (File → Save As in PowerPoint/Word/Excel) and upload that instead."
+                    )
+                else:
+                    st.error(f"{upload.name}: {error}")
             progress.progress(index / len(uploads))
 
         if successful_uploads:
